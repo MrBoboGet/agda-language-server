@@ -34,12 +34,14 @@ import           Agda.Syntax.Abstract.Pretty    ( prettyATop )
 import           Agda.Syntax.Parser             ( exprParser
                                                 , parse
                                                 )
+import           Agda.Syntax.Parser.Tokens      ( Token(..))
 import           Agda.Syntax.Translation.ConcreteToAbstract
                                                 ( concreteToAbstract_ )
 import           Agda.TypeChecking.Monad        ( HasOptions(commandLineOptions)
                                                 , setInteractionOutputCallback
                                                 )
 import           Agda.TypeChecking.Warnings     ( runPM )
+import qualified Agda.Syntax.Position as APosition
 #if MIN_VERSION_Agda(2,6,4)
 import           Agda.Syntax.Common.Pretty      ( render )
 #else
@@ -61,6 +63,11 @@ import           Monad
 import           Options                        ( Config
                                                 , Options(optRawAgdaOptions)
                                                 )
+
+import qualified Data.Strict as Strict 
+import qualified Data.Map as Map 
+import qualified Language.LSP.Types as LSPTypes 
+import Data.List
 
 initialiseCommandQueue :: IO CommandQueue
 initialiseCommandQueue = CommandQueue <$> newTChanIO <*> newTVarIO Nothing
@@ -134,6 +141,75 @@ onHover uri pos = do
                         (pack typeString)
                   return $ Just $ LSP.Hover content (Just range)
 
+
+lineLength :: APosition.Interval ->  LSP.UInt
+lineLength (APosition.Interval p1 p2) = fromInteger $ fromIntegral (APosition.posCol p2 - APosition.posCol p1)
+
+convertTokenType :: Token -> LSP.SemanticTokenTypes 
+convertTokenType (TokKeyword _ _) = LSP.SttNamespace
+convertTokenType (TokId (_ , _)) = LSP.SttVariable
+convertTokenType (TokQId _) = LSP.SttVariable
+convertTokenType (TokLiteral _) = LSP.SttString
+convertTokenType (TokSymbol _ _) = LSP.SttClass
+convertTokenType (TokString _) = LSP.SttString
+convertTokenType (TokTeX (_ , _)) = LSP.SttComment
+convertTokenType (TokMarkup (_ , _)) = LSP.SttComment
+convertTokenType (TokComment (_ , _)) = LSP.SttComment
+convertTokenType TokDummy = LSP.SttNamespace
+convertTokenType (TokEOF _) = LSP.SttNamespace
+
+tokenInterval :: Token -> APosition.Interval
+tokenInterval (TokKeyword _ i) = i
+tokenInterval (TokId (i , _)) = i
+tokenInterval (TokQId (head : tail)) = fst head
+tokenInterval (TokQId []) = APosition.Interval   (APosition.Pn Strict.Nothing 0 0 0)  (APosition.Pn Strict.Nothing 0 0 0)
+tokenInterval (TokLiteral _) = APosition.Interval   (APosition.Pn Strict.Nothing 0 0 0)  (APosition.Pn Strict.Nothing 0 0 0)
+tokenInterval (TokSymbol _ i) = i
+tokenInterval (TokString (i , _)) = i
+tokenInterval (TokTeX (i , _)) = i
+tokenInterval (TokMarkup (i , _)) = i
+tokenInterval (TokComment (i , _)) = i
+tokenInterval TokDummy = APosition.Interval   (APosition.Pn Strict.Nothing 0 0 0)  (APosition.Pn Strict.Nothing 0 0 0)
+tokenInterval (TokEOF i) = i
+
+tokenLength :: Token -> LSP.UInt
+tokenLength t = lineLength $ tokenInterval t
+
+tokenLineStart :: Token -> LSP.UInt
+tokenLineStart t = fromIntegral $ APosition.posLine (APosition.iStart $ tokenInterval t)
+tokenColStart :: Token -> LSP.UInt
+tokenColStart t = fromIntegral $ APosition.posCol (APosition.iStart $ tokenInterval t)
+
+convertTokens :: (LSP.SemanticTokenTypes -> LSP.UInt) -> [Token] -> LSP.Position -> LSP.List LSP.UInt
+convertTokens f [] (LSP.Position l  r) = LSP.List []
+convertTokens f (head : tail) (LSP.Position l  r) = LSP.List [ tokenLineStart head - l , tokenColStart head - r , 2 , f $ convertTokenType head , 0] <> convertTokens f tail (LSP.Position (tokenLineStart head) (tokenColStart head))
+
+
+--defaultMap :: Map.Map;
+--defaultMap = Map.fromList (LSPTypes.SemanticTokensLegend)
+
+defaultTokenMap :: LSP.SemanticTokenTypes -> LSP.UInt
+defaultTokenMap a = fromIntegral $ case (elemIndex a LSP.knownSemanticTokenTypes) of
+                                        Nothing -> 0
+                                        Just i -> i
+
+
+onHighlight :: LSP.Uri -> ServerM (LspM Config) (Maybe LSP.SemanticTokens)
+onHighlight uri = do
+  result <- LSP.getVirtualFile (LSP.toNormalizedUri uri)
+  case result of
+    Nothing   -> return Nothing
+    Just file -> do
+      let source      = VFS.virtualFileText file
+      let offsetTable = makeToOffset source
+      mtokens <- Parser.getTokens uri source
+      case mtokens of
+        Nothing             -> return Nothing
+        Just tokens -> do
+          case LSP.uriToFilePath uri of
+            Nothing       -> return Nothing
+            Just filepath -> do
+              return (Just (LSP.SemanticTokens Nothing (convertTokens  (const 1) tokens (LSP.Position 0 0) )))
 --------------------------------------------------------------------------------
 -- Helper functions for converting stuff to SemanticTokenAbsolute
 
@@ -141,6 +217,8 @@ onHover uri pos = do
 fromHighlightingInfo :: IR.HighlightingInfo -> LSP.SemanticTokenAbsolute
 fromHighlightingInfo (IR.HighlightingInfo start end aspects isTokenBased note defSrc)
   = LSP.SemanticTokenAbsolute 1 1 3 LSP.SttKeyword []
+
+
 
 -- HighlightingInfo
 --       Int -- starting offset

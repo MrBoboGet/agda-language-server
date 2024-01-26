@@ -72,3 +72,28 @@ tokenAt uri source position = case LSP.uriToFilePath uri of
     tokenOffsets token = do
       (start, end) <- startAndEnd (getRange token)
       return (fromIntegral (posPos start), fromIntegral (posPos end))
+
+getTokens :: LSP.Uri -> Text ->  ServerM (LspM Config) (Maybe [Token])
+getTokens uri source = case LSP.uriToFilePath uri of
+  Nothing -> return Nothing
+  Just filepath -> do
+    let file =
+#if MIN_VERSION_Agda(2,6,3)
+          RangeFile (mkAbsolute filepath) Nothing
+#else
+          mkAbsolute filepath
+#endif
+    (result, _warnings) <- liftIO $
+      runPMIO $ do
+        -- parse the file and get all tokens
+        (r, _fileType) <- parseFile tokensParser file (unpack source)
+        let tokens =
+#if MIN_VERSION_Agda(2,6,3)
+              fst r
+#else
+              r
+#endif
+        return tokens
+    case result of 
+        Left _err -> return Nothing
+        Right returnValue -> return (Just returnValue)

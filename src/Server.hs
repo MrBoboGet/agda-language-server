@@ -24,6 +24,7 @@ import qualified Language.LSP.Server as LSP
 import Language.LSP.Types hiding
   ( Options (..),
     TextDocumentSyncClientCapabilities (..),
+    SemanticTokensClientCapabilities (..),
   )
 import Monad
 import qualified Network.Simple.TCP as TCP
@@ -75,6 +76,7 @@ run options = do
 
     lspOptions :: LSP.Options
     lspOptions = defaultOptions {textDocumentSync = Just syncOptions}
+                --semanticTokensProvider = SemanticTokensOptions Nothing (SemanticTokensLegend [] []) (Just False) (Just True)  }
 
     -- these `TextDocumentSyncOptions` are essential for receiving notifications from the client
     syncOptions :: TextDocumentSyncOptions
@@ -114,8 +116,9 @@ handlers =
       notificationHandler STextDocumentDidSave $ \_not -> pure (),
       notificationHandler STextDocumentDidChange $ \_not -> pure (),
       notificationHandler SCancelRequest $ \_not -> pure ()
-      -- -- syntax highlighting
-      -- , requestHandler STextD_cumentSemanticTokensFull $ \req responder -> do
-      --   result <- Handler.onHighlight (req ^. (params . textDocument . uri))
-      --   responder result
+      -- syntax highlighting
+      , requestHandler STextDocumentSemanticTokensFull $ \req responder -> do
+        let RequestMessage _ _ _ (SemanticTokensParams _ _ (TextDocumentIdentifier uri)) = req
+        result <- Handler.onHighlight uri
+        responder (Right result)
     ]

@@ -261,3 +261,4 @@ data CommandErr
   deriving (Generic)
 
 instance ToJSON CommandErr
+
