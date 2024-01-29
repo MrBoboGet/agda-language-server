@@ -15,8 +15,6 @@ import           Agda.Interaction.Base          ( CommandM
 import           Agda.Interaction.BasicOps      ( atTopLevel
                                                 , typeInCurrent
                                                 )
-import           Agda.Interaction.Highlighting.Precise
-                                                ( HighlightingInfo )
 import qualified Agda.Interaction.Imports      as Imp
 import           Agda.Interaction.InteractionTop
                                                 ( cmd_load'
@@ -32,11 +30,12 @@ import           Agda.Position                  ( makeToOffset
                                                 )
 import           Agda.Syntax.Abstract.Pretty    ( prettyATop )
 import           Agda.Syntax.Parser             ( exprParser
-                                                , parse
+                                                , parse , moduleParser , parseFile
                                                 )
+import           Agda.Syntax.Concrete             ( Module(..),Declaration(..))
 import           Agda.Syntax.Parser.Tokens      ( Token(..))
 import           Agda.Syntax.Translation.ConcreteToAbstract
-                                                ( concreteToAbstract_ )
+                                                ( concreteToAbstract_ , TopLevel(..),TopLevelInfo(..))
 import           Agda.TypeChecking.Monad        ( HasOptions(commandLineOptions)
                                                 , setInteractionOutputCallback
                                                 )
@@ -68,6 +67,18 @@ import qualified Data.Strict as Strict
 import qualified Data.Map as Map 
 import qualified Language.LSP.Types as LSPTypes 
 import Data.List
+import Agda.Interaction.Imports
+import Agda.Syntax.TopLevelModuleName
+import Agda.Utils.FileName
+import Agda.Interaction.FindFile
+import Agda.Interaction.Highlighting.FromAbstract
+import Agda.Interaction.Highlighting.Precise
+import Agda.Utils.RangeMap
+import Agda.Syntax.Abstract.Name
+import Agda.Syntax.Scope.Base
+import qualified Agda.Syntax.Common.Aspect as Aspect
+import Agda.Interaction.Highlighting.Range as A
+import qualified Server.Index as Index
 
 initialiseCommandQueue :: IO CommandQueue
 initialiseCommandQueue = CommandQueue <$> newTChanIO <*> newTVarIO Nothing
@@ -109,6 +120,46 @@ inferTypeOfText filepath text = runCommandM $ do
       concreteToAbstract_ e >>= typeInCurrent norm
 
   render <$> prettyATop typ
+
+    
+
+getAbstract :: FilePath -> Text -> ServerM (LspM Config) (Either String (TopLevelModuleName,Index.LineIndex  , TopLevelInfo))
+getAbstract filepath text = runCommandM $ do
+  -- localStateCommandM: restore TC state afterwards, do we need this here?
+  (n,i,t) <- localStateCommandM $ do
+    fp <- liftIO $ absolute filepath
+    s <- lift $ parseSource (SourceFile fp)
+    index <- liftIO $ Index.fileToLindeIndex filepath
+    lift $ atTopLevel $ do 
+            t <- concreteToAbstract_ (TopLevel fp (srcModuleName s) (modDecls (srcModule s)))
+            return (srcModuleName s , index , t)
+  return (n,i,t)
+
+--getSemanticTokens :: 
+
+--kindMap :: KindOfName -> NameKind
+--kindMap ConName = Constructor Aspect.Inductive
+--kindMap CoConName = Constructor Aspect.CoInductive
+--kindMap FldName = Aspect.Record
+--kindMap PatternSynName = Aspect.Function
+--kindMap GeneralizeName = Aspect.Generalizable
+--kindMap DisallowedGeneralizeName = Aspect.Generalizable
+--kindMap MacroName = Aspect.Macro
+--kindMap QuotableName = Aspect.Field
+--kindMap DataName = Aspect.Record
+--kindMap RecName = Aspect.Record
+--kindMap FunName = Aspect.Function
+--kindMap AxiomName = Aspect.Postulate
+--kindMap PrimName = Aspect.Primitive
+--kindMap OtherDefName = Aspect.Argument
+
+
+nameLookup :: NameMap -> (QName -> Maybe NameKind)
+nameLookup m x = case Map.lookup x m of 
+                Nothing -> Nothing 
+                Just a -> Just (kindOfNameToNameKind (qnameKind a))
+getHighlightInfo :: TopLevelInfo -> TopLevelModuleName -> RangeMap Aspects
+getHighlightInfo top@(TopLevelInfo decls scope) name = convert (runHighlighter name (nameLookup (_scopeInverseName scope)) decls)
 
 onHover :: LSP.Uri -> LSP.Position -> ServerM (LspM Config) (Maybe LSP.Hover)
 onHover uri pos = do
@@ -176,9 +227,9 @@ tokenLength :: Token -> LSP.UInt
 tokenLength t = lineLength $ tokenInterval t
 
 tokenLineStart :: Token -> LSP.UInt
-tokenLineStart t = fromIntegral $ APosition.posLine (APosition.iStart $ tokenInterval t)
+tokenLineStart t = (fromIntegral $ APosition.posLine (APosition.iStart $ tokenInterval t)) - fromIntegral 1
 tokenColStart :: Token -> LSP.UInt
-tokenColStart t = fromIntegral $ APosition.posCol (APosition.iStart $ tokenInterval t)
+tokenColStart t = (fromIntegral $ APosition.posCol (APosition.iStart $ tokenInterval t)) - fromIntegral 1
 
 convertTokens :: (LSP.SemanticTokenTypes -> LSP.UInt) -> [Token] -> LSP.Position -> LSP.List LSP.UInt
 convertTokens f [] (LSP.Position l  r) = LSP.List []
@@ -194,22 +245,45 @@ defaultTokenMap a = fromIntegral $ case (elemIndex a LSP.knownSemanticTokenTypes
                                         Just i -> i
 
 
+--type ASTInfo = [(LSP.Position , Aspects)]
+--convertHighlightInfo :: Index.LineIndex -> RangeMap Aspects -> ASTInfo
+--convertHighlightInfo index rangeMap = do 
+--                                        a <- toList rangeMap
+--                                        b <- map (\((A.Range start end),content) -> ((LSP.Position (fromIntegral start) (fromIntegral end)) , content)) a
+--                                        []
+
+aspectToSemantic :: Aspect -> LSP.SemanticTokenTypes
+aspectToSemantic _ = LSP.SttFunction
+
+convertRangeTokens :: Int -> Int -> Index.LineIndex -> (LSP.SemanticTokenTypes -> LSP.UInt) -> [(A.Range , Aspects)] -> LSP.List LSP.UInt
+convertRangeTokens prevLine prevCol index map ( (A.Range start end , a) : tail) = case aspect a of 
+                                                                    Nothing -> convertRangeTokens prevLine prevCol index map tail
+                                                                    Just asp -> do 
+                                                                                  let (LSP.Position line col) = Index.offsetToPosition index start
+                                                                                  let (LSP.Position _ endCol) = Index.offsetToPosition index end
+                                                                                  (LSP.List 
+                                                                                    [ line - (fromIntegral prevLine) , col - (fromIntegral  prevCol) , (col - endCol) , map $ aspectToSemantic asp, 0]) 
+                                                                                    <> convertRangeTokens (fromIntegral line) (fromIntegral col) index map tail
+
+
+convertRangeTokens line col index map [] = LSP.List []
+
 onHighlight :: LSP.Uri -> ServerM (LspM Config) (Maybe LSP.SemanticTokens)
-onHighlight uri = do
+onHighlight uri@(LSP.Uri path) = do
   result <- LSP.getVirtualFile (LSP.toNormalizedUri uri)
   case result of
     Nothing   -> return Nothing
     Just file -> do
       let source      = VFS.virtualFileText file
       let offsetTable = makeToOffset source
-      mtokens <- Parser.getTokens uri source
-      case mtokens of
-        Nothing             -> return Nothing
-        Just tokens -> do
+      mAbstract <- getAbstract (unpack path) source
+      case mAbstract of
+        Left _             -> return Nothing
+        Right (n,index,ast) -> do
           case LSP.uriToFilePath uri of
             Nothing       -> return Nothing
             Just filepath -> do
-              return (Just (LSP.SemanticTokens Nothing (convertTokens  (const 1) tokens (LSP.Position 0 0) )))
+              return (Just (LSP.SemanticTokens Nothing (convertRangeTokens 0 0 index defaultTokenMap (toList (getHighlightInfo ast n)))))
 --------------------------------------------------------------------------------
 -- Helper functions for converting stuff to SemanticTokenAbsolute
 
