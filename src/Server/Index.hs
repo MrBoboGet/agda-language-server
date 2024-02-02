@@ -12,8 +12,8 @@ newLines offset [] = []
 newLines offset ('n':tail) = offset : newLines (offset + 1) tail
 newLines offset (x:tail) = newLines (offset + 1) tail
 
-fileToLindeIndex :: FilePath -> IO LineIndex
-fileToLindeIndex p = do 
+fileToLineIndex :: FilePath -> IO LineIndex
+fileToLineIndex p = do 
                         text <- readFile p
                         let lines = 0 : newLines 0 text
                         let result = listArray (0,length lines) lines
@@ -21,9 +21,9 @@ fileToLindeIndex p = do
 
 offsetToPosition :: LineIndex -> Int -> LSP.Position
 offsetToPosition index offset = let line = max (binarySearch (<) index offset-1) 0 in
-                                LSP.Position (fromIntegral line) (fromIntegral (offset - fromIntegral (index ! line)))
+                                LSP.Position (fromIntegral line) (fromIntegral (offset - (fromIntegral (index ! line) + 1)))
 positionToOffset :: LineIndex -> LSP.Position -> Int
-positionToOffset index (LSP.Position line col) = (index ! (fromIntegral line)) + fromIntegral col
+positionToOffset index (LSP.Position line col) = ((index ! (fromIntegral line)) + fromIntegral col)+1
 
 binarySearchImpl :: Int -> Int -> (a -> b -> Bool) -> Array Int a -> b -> Int
 binarySearchImpl lower upper less array target = let index = div (lower + upper) 2

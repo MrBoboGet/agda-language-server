@@ -1,6 +1,4 @@
-{-# LANGUAGE CPP #-}
-
-module Server.Handler where
+{-# LANGUAGE CPP #-} module Server.Handler where
 
 import           Agda                           ( getCommandLineOptions
                                                 , runAgda
@@ -72,13 +70,27 @@ import Agda.Syntax.TopLevelModuleName
 import Agda.Utils.FileName
 import Agda.Interaction.FindFile
 import Agda.Interaction.Highlighting.FromAbstract
-import Agda.Interaction.Highlighting.Precise
+import qualified Agda.Interaction.Highlighting.Precise as P
 import Agda.Utils.RangeMap
 import Agda.Syntax.Abstract.Name
 import Agda.Syntax.Scope.Base
 import qualified Agda.Syntax.Common.Aspect as Aspect
 import Agda.Interaction.Highlighting.Range as A
 import qualified Server.Index as Index
+import qualified Language.LSP.Server as LSPServer
+
+
+import qualified Agda.TypeChecking.Errors as TCM
+import qualified Agda.TypeChecking.Monad  as TCM
+import qualified Agda.TypeChecking.Pretty as TCM
+import qualified Agda.Interaction.Highlighting.Generate as G
+import qualified Agda.Utils.Impossible as IM
+import qualified Data.IntMap as IntMap
+import Agda.Utils.List            ( caseList, last1 )
+
+import qualified Server.Highlight as H
+import qualified Agda.Syntax.Concrete as C
+import qualified Agda.Syntax.Abstract as Abs
 
 initialiseCommandQueue :: IO CommandQueue
 initialiseCommandQueue = CommandQueue <$> newTChanIO <*> newTVarIO Nothing
@@ -123,17 +135,28 @@ inferTypeOfText filepath text = runCommandM $ do
 
     
 
-getAbstract :: FilePath -> Text -> ServerM (LspM Config) (Either String (TopLevelModuleName,Index.LineIndex  , TopLevelInfo))
-getAbstract filepath text = runCommandM $ do
+getAbstract :: FilePath -> ServerM (LspM Config) (Either String (TopLevelModuleName,Index.LineIndex  , TopLevelInfo))
+getAbstract filepath = runCommandM $ do
   -- localStateCommandM: restore TC state afterwards, do we need this here?
   (n,i,t) <- localStateCommandM $ do
     fp <- liftIO $ absolute filepath
     s <- lift $ parseSource (SourceFile fp)
-    index <- liftIO $ Index.fileToLindeIndex filepath
+    index <- liftIO $ Index.fileToLineIndex filepath
     lift $ atTopLevel $ do 
-            t <- concreteToAbstract_ (TopLevel fp (srcModuleName s) (modDecls (srcModule s)))
+            t <- concreteToAbstract_ (TopLevel fp (srcModuleName s) ([] :: [Declaration]) )
             return (srcModuleName s , index , t)
+    --lift $ atTopLevel $ do 
+    --        t <- concreteToAbstract_ (TopLevel fp (srcModuleName s) (modDecls (srcModule s)))
+    --        return (srcModuleName s , index , t)
   return (n,i,t)
+
+getHighlightFile :: FilePath -> ServerM (LspM Config) (Either String (Index.LineIndex , [(A.Range , P.Aspects)]))
+getHighlightFile filepath = runCommandM $ do
+         fp <- liftIO $ absolute filepath
+         s <- lift $ parseSource (SourceFile fp)
+         highlight <- lift $ atTopLevel $ do (getHighlightSource s)
+         index <- liftIO $ Index.fileToLineIndex filepath
+         return (index, highlight)
 
 --getSemanticTokens :: 
 
@@ -154,12 +177,17 @@ getAbstract filepath text = runCommandM $ do
 --kindMap OtherDefName = Aspect.Argument
 
 
-nameLookup :: NameMap -> (QName -> Maybe NameKind)
+nameLookup :: NameMap -> (QName -> Maybe P.NameKind)
 nameLookup m x = case Map.lookup x m of 
                 Nothing -> Nothing 
-                Just a -> Just (kindOfNameToNameKind (qnameKind a))
-getHighlightInfo :: TopLevelInfo -> TopLevelModuleName -> RangeMap Aspects
-getHighlightInfo top@(TopLevelInfo decls scope) name = convert (runHighlighter name (nameLookup (_scopeInverseName scope)) decls)
+                Just a -> Just (P.kindOfNameToNameKind (qnameKind a))
+getHighlightInfo :: TopLevelInfo -> TopLevelModuleName -> RangeMap P.Aspects
+getHighlightInfo top@(TopLevelInfo decls scope) name = P.convert (runHighlighter name (nameLookup (_scopeInverseName scope)) decls)
+
+getHighlightSource :: Source -> TCM.TCM [(A.Range , P.Aspects)]
+getHighlightSource s = do
+                         (CheckResult interface _ _ _) <- (typeCheckMain ScopeCheck s)
+                         return (toList $ TCM.iHighlighting interface)
 
 onHover :: LSP.Uri -> LSP.Position -> ServerM (LspM Config) (Maybe LSP.Hover)
 onHover uri pos = do
@@ -252,38 +280,88 @@ defaultTokenMap a = fromIntegral $ case (elemIndex a LSP.knownSemanticTokenTypes
 --                                        b <- map (\((A.Range start end),content) -> ((LSP.Position (fromIntegral start) (fromIntegral end)) , content)) a
 --                                        []
 
-aspectToSemantic :: Aspect -> LSP.SemanticTokenTypes
-aspectToSemantic _ = LSP.SttFunction
+nameKindToSemantic :: P.NameKind -> LSP.SemanticTokenTypes
+nameKindToSemantic (P.Constructor _) = LSP.SttMacro
+nameKindToSemantic P.Datatype = LSP.SttClass
+nameKindToSemantic P.Field = LSP.SttVariable
+nameKindToSemantic P.Module = LSP.SttNamespace
+nameKindToSemantic P.Postulate = LSP.SttMacro
+nameKindToSemantic P.Primitive = LSP.SttClass
+nameKindToSemantic P.Record = LSP.SttMacro
+nameKindToSemantic P.Argument = LSP.SttVariable
+nameKindToSemantic P.Macro = LSP.SttMacro
+nameKindToSemantic _ = LSP.SttFunction
 
-convertRangeTokens :: Int -> Int -> Index.LineIndex -> (LSP.SemanticTokenTypes -> LSP.UInt) -> [(A.Range , Aspects)] -> LSP.List LSP.UInt
-convertRangeTokens prevLine prevCol index map ( (A.Range start end , a) : tail) = case aspect a of 
-                                                                    Nothing -> convertRangeTokens prevLine prevCol index map tail
-                                                                    Just asp -> do 
-                                                                                  let (LSP.Position line col) = Index.offsetToPosition index start
-                                                                                  let (LSP.Position _ endCol) = Index.offsetToPosition index end
-                                                                                  (LSP.List 
-                                                                                    [ line - (fromIntegral prevLine) , col - (fromIntegral  prevCol) , (col - endCol) , map $ aspectToSemantic asp, 0]) 
-                                                                                    <> convertRangeTokens (fromIntegral line) (fromIntegral col) index map tail
+aspectToSemantic :: P.Aspect -> LSP.SemanticTokenTypes
+aspectToSemantic P.Comment = LSP.SttComment
+aspectToSemantic P.Keyword = LSP.SttKeyword
+aspectToSemantic P.String = LSP.SttString
+aspectToSemantic P.Number = LSP.SttNumber
+aspectToSemantic P.Hole = LSP.SttString
+aspectToSemantic P.Symbol = LSP.SttVariable
+aspectToSemantic P.PrimitiveType = LSP.SttClass
+aspectToSemantic (P.Name Nothing _) = LSP.SttFunction
+aspectToSemantic (P.Name (Just kind) _) = LSP.SttFunction
+aspectToSemantic P.Pragma = LSP.SttComment
+aspectToSemantic P.Background = LSP.SttComment
+aspectToSemantic P.Markup = LSP.SttComment
+
+convertRangeTokens :: Int -> Int -> Index.LineIndex -> (LSP.SemanticTokenTypes -> LSP.UInt) -> [(A.Range , P.Aspects)] -> LSP.List LSP.UInt
+convertRangeTokens prevLine prevCol index map ( (A.Range start end , a) : tail) = case P.aspect a of 
+    Nothing -> convertRangeTokens prevLine prevCol index map tail
+    Just asp -> do 
+                  let (LSP.Position line col) = Index.offsetToPosition index start
+                  let (LSP.Position _ endCol) = Index.offsetToPosition index end
+                  (LSP.List 
+                    [ line - (fromIntegral prevLine) , col - (fromIntegral  prevCol) , (col - endCol) , map $ aspectToSemantic asp, 0]) 
+                    <> convertRangeTokens (fromIntegral line) (fromIntegral col) index map tail
 
 
 convertRangeTokens line col index map [] = LSP.List []
 
+getDeclarationHighlight :: Abs.Declaration -> ServerM (LspM Config) (Either String [(APosition.Range,P.Aspects)])
+getDeclarationHighlight decl = runCommandM $  do
+    result <- lift $ atTopLevel $ H.generateSyntaxInfo decl False
+    return result
+
+getTopHighlightInfo :: [Abs.Declaration] -> ServerM (LspM Config) [(APosition.Range,P.Aspects)]
+getTopHighlightInfo [] = do return []
+getTopHighlightInfo (head : tail) = do 
+                                declHighlight <- getDeclarationHighlight head
+                                rest <- getTopHighlightInfo tail
+                                case declHighlight of 
+                                    Left _ -> return rest
+                                    Right headTokens -> return (headTokens <> rest)
+
+
 onHighlight :: LSP.Uri -> ServerM (LspM Config) (Maybe LSP.SemanticTokens)
-onHighlight uri@(LSP.Uri path) = do
-  result <- LSP.getVirtualFile (LSP.toNormalizedUri uri)
-  case result of
-    Nothing   -> return Nothing
-    Just file -> do
-      let source      = VFS.virtualFileText file
-      let offsetTable = makeToOffset source
-      mAbstract <- getAbstract (unpack path) source
-      case mAbstract of
-        Left _             -> return Nothing
-        Right (n,index,ast) -> do
-          case LSP.uriToFilePath uri of
-            Nothing       -> return Nothing
-            Just filepath -> do
-              return (Just (LSP.SemanticTokens Nothing (convertRangeTokens 0 0 index defaultTokenMap (toList (getHighlightInfo ast n)))))
+onHighlight ur =
+  case LSP.uriToFilePath ur of 
+    Nothing -> return Nothing
+    Just path -> do 
+      (AbsolutePath fp) <- liftIO $ absolute path
+      runCommandM $ cmd_load' (unpack fp) [] True Imp.ScopeCheck $ \_ -> do return ()
+      --return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttClass ,0]) ))
+      highlight <- getHighlightFile path
+      case highlight of
+        Left s -> do
+                    LSPServer.sendNotification LSP.SWindowShowMessage (LSP.ShowMessageParams LSP.MtError (pack s))
+                    return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttVariable ,0]) ))
+        Right (i,h) -> do
+              return (Just (LSP.SemanticTokens Nothing (convertRangeTokens 0 0 i defaultTokenMap h)))
+      ----return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttClass ,0]) ))
+      --case result of
+      --  Nothing   -> return Nothing
+      --  Just file -> do
+      --    let source      = VFS.virtualFileText file
+      --    --return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttClass ,0]) ))
+      --    mAbstract <- getAbstract path 
+      --    case mAbstract of
+      --      Left s -> do
+      --                  LSPServer.sendNotification LSP.SWindowShowMessage (LSP.ShowMessageParams LSP.MtError (pack s))
+      --                  return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttClass ,0]) ))
+      --      Right (n,index,ast) -> do
+      --            return (Just (LSP.SemanticTokens Nothing (convertRangeTokens 0 0 index defaultTokenMap (toList (getHighlightInfo ast n)))))
 --------------------------------------------------------------------------------
 -- Helper functions for converting stuff to SemanticTokenAbsolute
 
