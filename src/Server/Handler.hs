@@ -91,6 +91,8 @@ import Agda.Utils.List            ( caseList, last1 )
 import qualified Server.Highlight as H
 import qualified Agda.Syntax.Concrete as C
 import qualified Agda.Syntax.Abstract as Abs
+import qualified Agda.Interaction.Base as CM
+import Data.Sequence
 
 initialiseCommandQueue :: IO CommandQueue
 initialiseCommandQueue = CommandQueue <$> newTChanIO <*> newTVarIO Nothing
@@ -300,8 +302,8 @@ aspectToSemantic P.Number = LSP.SttNumber
 aspectToSemantic P.Hole = LSP.SttString
 aspectToSemantic P.Symbol = LSP.SttVariable
 aspectToSemantic P.PrimitiveType = LSP.SttClass
-aspectToSemantic (P.Name Nothing _) = LSP.SttFunction
-aspectToSemantic (P.Name (Just kind) _) = LSP.SttFunction
+aspectToSemantic (P.Name Nothing _) = LSP.SttClass
+aspectToSemantic (P.Name (Just kind) _) = nameKindToSemantic kind
 aspectToSemantic P.Pragma = LSP.SttComment
 aspectToSemantic P.Background = LSP.SttComment
 aspectToSemantic P.Markup = LSP.SttComment
@@ -311,12 +313,12 @@ convertRangeTokens prevLine prevCol index map ( (A.Range start end , a) : tail) 
     Nothing -> convertRangeTokens prevLine prevCol index map tail
     Just asp -> do 
                   let (LSP.Position line col) = Index.offsetToPosition index start
-                  let (LSP.Position _ endCol) = Index.offsetToPosition index end
+                  let (LSP.Position endLine endCol) = Index.offsetToPosition index end
+                  let deltaCol = if line == fromIntegral prevLine  then  col - (fromIntegral prevCol) else col
+                  let length = if endCol > col  then  endCol - col else (if line /= endLine then 100+endLine else 1000+line)
                   (LSP.List 
-                    [ line - (fromIntegral prevLine) , col - (fromIntegral  prevCol) , (col - endCol) , map $ aspectToSemantic asp, 0]) 
+                    [ line - (fromIntegral prevLine) , deltaCol , length , map $ aspectToSemantic asp, 0]) 
                     <> convertRangeTokens (fromIntegral line) (fromIntegral col) index map tail
-
-
 convertRangeTokens line col index map [] = LSP.List []
 
 getDeclarationHighlight :: Abs.Declaration -> ServerM (LspM Config) (Either String [(APosition.Range,P.Aspects)])
@@ -334,21 +336,65 @@ getTopHighlightInfo (head : tail) = do
                                     Right headTokens -> return (headTokens <> rest)
 
 
+getWriteContent :: [(A.Range , P.Aspects)] -> String
+getWriteContent input = foldl (<>) "" (map (\((A.Range x y),_) -> (show x) <> " " <> (show y) <> "\n") input)
+writeResult :: String -> String -> IO ()
+writeResult file input = do
+                writeFile file input
+                return ()
+
+writeIndexResult :: Index.LineIndex -> [(A.Range , P.Aspects)] -> String
+writeIndexResult index aspects = foldl (<>) "" (map (\((LSP.Position x y),(LSP.Position x2 y2)) -> "(" <> (show x) <> "," <> (show y)<>") ("<> (show x2) <> "," <> (show y2) <> ")\n")  ((map (\((A.Range x y) , _) -> ((Index.offsetToPosition index x),(Index.offsetToPosition index y))))   aspects))
+
+writeTokensResult :: LSP.List LSP.UInt -> String
+writeTokensResult (LSP.List (x1:x2:x3:x4:x5:tail)) = (foldl (\x y -> x <> " " <> (show y)) "" [x1,x2,x3,x4,x5]) <> "\n" <> 
+    (writeTokensResult (LSP.List tail))
+writeTokensResult _ = ""
+
+
 onHighlight :: LSP.Uri -> ServerM (LspM Config) (Maybe LSP.SemanticTokens)
 onHighlight ur =
   case LSP.uriToFilePath ur of 
     Nothing -> return Nothing
     Just path -> do 
       (AbsolutePath fp) <- liftIO $ absolute path
-      runCommandM $ cmd_load' (unpack fp) [] True Imp.ScopeCheck $ \_ -> do return ()
-      --return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttClass ,0]) ))
-      highlight <- getHighlightFile path
-      case highlight of
-        Left s -> do
-                    LSPServer.sendNotification LSP.SWindowShowMessage (LSP.ShowMessageParams LSP.MtError (pack s))
-                    return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttVariable ,0]) ))
-        Right (i,h) -> do
-              return (Just (LSP.SemanticTokens Nothing (convertRangeTokens 0 0 i defaultTokenMap h)))
+      result <- runCommandM $ do  
+          cmd_load' (unpack fp) [] True Imp.TypeCheck $ \_ -> return ()
+          index <- liftIO $ Index.fileToLineIndex (unpack fp)
+          tc <- TCM.getTC
+          cm <- get
+          let file = CM.theCurrentFile cm
+          
+          (stringToPrint, indexString , tokenResult,tokenReturn) <- case file of 
+            Nothing -> do
+                --LSPServer.sendNotification LSP.SWindowShowMessage (LSP.ShowMessageParams LSP.MtError (pack "no current file :((("))
+                return ("","","",(Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttVariable ,0]) )))
+            Just content -> do
+                let persistentState = TCM.stPersistentState tc
+                let modName = CM.currentFileModule content
+                let moduleInfo = Map.lookup modName (TCM.stDecodedModules persistentState)
+                case moduleInfo of
+                    Nothing -> do
+                        --LSPServer.sendNotification LSP.SWindowShowMessage (LSP.ShowMessageParams LSP.MtError (pack "no current file :((("))
+                        return ("","","",(Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttClass ,0]) )))
+                    Just content -> do
+                        --LSPServer.sendNotification LSP.SWindowShowMessage (LSP.ShowMessageParams LSP.MtError (pack "no current file :((("))
+                        let highlight = TCM.iHighlighting $ TCM.miInterface content
+                        let listTokens = toList highlight
+                        let semTokensContet = convertRangeTokens 0 0 index defaultTokenMap listTokens
+                        let semTokens = (LSP.SemanticTokens Nothing semTokensContet)
+                        return (getWriteContent listTokens, writeIndexResult index listTokens, writeTokensResult semTokensContet, (Just semTokens ))
+          liftIO (writeResult "C:/Users/emanu/Desktop/Program/Haskell/agda-language-server/offset.txt" stringToPrint)
+          liftIO (writeResult "C:/Users/emanu/Desktop/Program/Haskell/agda-language-server/index.txt" indexString)
+          liftIO (writeResult "C:/Users/emanu/Desktop/Program/Haskell/agda-language-server/sem.txt" tokenResult)
+          return tokenReturn
+      case result of 
+           Left s -> do
+                  LSPServer.sendNotification LSP.SWindowShowMessage (LSP.ShowMessageParams LSP.MtError (pack s))
+                  return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttMacro ,0]) ))
+           Right tokens -> do
+                  return tokens
+--return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttClass ,0]) ))
       ----return (Just (LSP.SemanticTokens Nothing (LSP.List [0,0,5,defaultTokenMap LSP.SttClass ,0]) ))
       --case result of
       --  Nothing   -> return Nothing

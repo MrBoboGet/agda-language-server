@@ -51,6 +51,8 @@ when:
 
 dependencies:
   - base >= 4.7 && < 5
+  - array
+  - unordered-containers
   - Agda
   - aeson
   - bytestring

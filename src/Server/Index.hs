@@ -9,7 +9,7 @@ type LineIndex = (Array Int Int)
 
 newLines :: Int -> String -> [Int]
 newLines offset [] = []
-newLines offset ('n':tail) = offset : newLines (offset + 1) tail
+newLines offset ('\n':tail) = offset : newLines (offset + 1) tail
 newLines offset (x:tail) = newLines (offset + 1) tail
 
 fileToLineIndex :: FilePath -> IO LineIndex
@@ -20,8 +20,13 @@ fileToLineIndex p = do
                         return result
 
 offsetToPosition :: LineIndex -> Int -> LSP.Position
+offsetToPosition index 1 = LSP.Position 0 0
 offsetToPosition index offset = let line = max (binarySearch (<) index offset-1) 0 in
-                                LSP.Position (fromIntegral line) (fromIntegral (offset - (fromIntegral (index ! line) + 1)))
+                                let lineOffset = fromIntegral (index ! line) in
+                                if line > 0 && (offset-1 == lineOffset) then
+                                    (LSP.Position (fromIntegral (line -1)) (fromIntegral (lineOffset - (index ! (line -1)))))
+                                else
+                                    LSP.Position (fromIntegral line) (fromIntegral (offset - (fromIntegral (index ! line) + 2)))
 positionToOffset :: LineIndex -> LSP.Position -> Int
 positionToOffset index (LSP.Position line col) = ((index ! (fromIntegral line)) + fromIntegral col)+1
 
