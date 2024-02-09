@@ -114,7 +114,10 @@ handlers =
       notificationHandler SInitialized $ \_not -> pure (),
       notificationHandler STextDocumentDidOpen $ \_not -> pure (),
       notificationHandler STextDocumentDidSave $ \_not -> pure (),
-      notificationHandler STextDocumentDidChange $ \_not -> pure (),
+      notificationHandler STextDocumentDidChange $ \not -> do
+          let NotificationMessage _ _ ( DidChangeTextDocumentParams (VersionedTextDocumentIdentifier uri _) changes ) = not
+          result <- Handler.onDocumentChanged uri changes
+          return () ,
       notificationHandler SCancelRequest $ \_not -> pure ()
       -- syntax highlighting
       , requestHandler STextDocumentSemanticTokensFull $ \req responder -> do

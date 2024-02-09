@@ -6,6 +6,8 @@ import Agda.Interaction.Highlighting.Range as A
 
 
 type LineIndex = (Array Int Int)
+empty :: LineIndex
+empty = array (0,0) []
 
 newLines :: Int -> String -> [Int]
 newLines offset [] = []

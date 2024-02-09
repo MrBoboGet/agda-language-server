@@ -5,6 +5,8 @@ module Options
   , usageMessage
   , Config(..)
   , initConfig
+  , empty
+  , LoadedFileInfo(..)
   ) where
 import           Data.Aeson.Types        hiding ( Options
                                                 , defaultOptions
@@ -13,6 +15,11 @@ import           GHC.Generics                   ( Generic )
 import           System.Console.GetOpt
 import           System.Environment             ( getArgs )
 import           Text.Read                      ( readMaybe )
+import qualified Data.Map as Map
+import qualified Language.LSP.Types as LSP
+import qualified Agda.Interaction.Highlighting.Precise as P
+import qualified Agda.Interaction.Base as IB
+import qualified Server.Index as Index
 
 getOptionsFromArgv :: IO Options
 getOptionsFromArgv = do
@@ -98,11 +105,19 @@ extractAgdaOpts argv =
 
 --------------------------------------------------------------------------------
 
-newtype Config = Config { configRawAgdaOptions :: [String] }
+data LoadedFileInfo = LoadedFileInfo (LSP.List LSP.UInt) (Map.Map String Int) [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)]
+  deriving (Eq, Show, Generic)
+data Config = Config { configRawAgdaOptions :: [String] , loadedFiles :: Map.Map String LoadedFileInfo }
   deriving (Eq, Show, Generic)
 
+empty :: LoadedFileInfo
+empty = LoadedFileInfo (LSP.List []) Map.empty [] 
+
+makeConf :: [String] -> Config
+makeConf strings = Config { configRawAgdaOptions = strings, loadedFiles = Map.empty}
+
 instance FromJSON Config where
-  parseJSON (Object v) = Config <$> v .: "commandLineOptions"
+  parseJSON (Object v) = makeConf <$> v .: "commandLineOptions"
   -- We do not expect a non-Object value here.
   -- We could use empty to fail, but typeMismatch
   -- gives a much more informative error message.
@@ -110,4 +125,4 @@ instance FromJSON Config where
     prependFailure "parsing Config failed, " (typeMismatch "Object" invalid)
 
 initConfig :: Config
-initConfig = Config []
+initConfig = makeConf []

@@ -38,18 +38,32 @@ aspectToSemantic P.Pragma = LSP.SttComment
 aspectToSemantic P.Background = LSP.SttComment
 aspectToSemantic P.Markup = LSP.SttComment
 
-convertRangeTokens :: Int -> Int -> Index.LineIndex -> (LSP.SemanticTokenTypes -> LSP.UInt) -> [(A.Range , P.Aspects)] -> LSP.List LSP.UInt
-convertRangeTokens prevLine prevCol index map ( (A.Range start end , a) : tail) = case P.aspect a of 
-    Nothing -> convertRangeTokens prevLine prevCol index map tail
+
+getAspectPositions :: Int -> Int -> Index.LineIndex -> [(A.Range , P.Aspects)] -> [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)]
+getAspectPositions prevLine prevCol index [] = []
+getAspectPositions prevLine prevCol index ( (A.Range start end , a) : tail) = 
+    do
+      let (LSP.Position line col) = Index.offsetToPosition index start
+      let (LSP.Position endLine endCol) = Index.offsetToPosition index end
+      let deltaCol = if line == fromIntegral prevLine  then  col - (fromIntegral prevCol) else col
+      let length = if endCol > col  then  endCol - col else (if line /= endLine then 100+endLine else 1000+line)
+      (line - (fromIntegral prevLine) , deltaCol , length , a) : (getAspectPositions (fromIntegral line) (fromIntegral col) index tail)
+
+convertRangeTokens :: LSP.UInt -> LSP.UInt -> (LSP.SemanticTokenTypes -> LSP.UInt) -> [(LSP.UInt , LSP.UInt, LSP.UInt ,P.Aspects)] -> LSP.List LSP.UInt
+convertRangeTokens eLine eCol map ( (dLine,dCol,length , a) : tail) = 
+    let newELine = eLine + dLine in 
+    let newECol = if dLine == 0 then eCol + dCol else 0 in 
+    case P.aspect a of 
+    Nothing -> convertRangeTokens newELine newECol map tail
     Just asp -> do 
-                  let (LSP.Position line col) = Index.offsetToPosition index start
-                  let (LSP.Position endLine endCol) = Index.offsetToPosition index end
-                  let deltaCol = if line == fromIntegral prevLine  then  col - (fromIntegral prevCol) else col
-                  let length = if endCol > col  then  endCol - col else (if line /= endLine then 100+endLine else 1000+line)
-                  (LSP.List 
-                    [ line - (fromIntegral prevLine) , deltaCol , length , map $ aspectToSemantic asp, 0]) 
-                    <> convertRangeTokens (fromIntegral line) (fromIntegral col) index map tail
-convertRangeTokens line col index map [] = LSP.List []
+                  if (asp == P.Symbol) then do
+                      convertRangeTokens newELine newECol map tail
+                  else
+                    do
+                      (LSP.List 
+                        [ dLine + eLine , dCol + (if dLine == 0 then eCol else 0), length , map $ aspectToSemantic asp, 0]) 
+                        <> convertRangeTokens 0 0 map tail
+convertRangeTokens _ _ map [] = LSP.List []
 
 
 getWriteContent :: [(A.Range , P.Aspects)] -> String
@@ -66,4 +80,3 @@ writeTokensResult :: LSP.List LSP.UInt -> String
 writeTokensResult (LSP.List (x1:x2:x3:x4:x5:tail)) = (foldl (\x y -> x <> " " <> (show y)) "" [x1,x2,x3,x4,x5]) <> "\n" <> 
     (writeTokensResult (LSP.List tail))
 writeTokensResult _ = ""
-
