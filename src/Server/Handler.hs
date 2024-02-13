@@ -222,6 +222,55 @@ onHighlight ur =
              else 
                 return Nothing
 
+--aspectToLocation :: P.Aspects -> IO LSP.Location
+--aspectToLocation asp = return (LSP.Location {})
+
+findAspect :: LSP.Position ->  LSP.UInt -> LSP.UInt -> [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)] -> Maybe P.Aspects
+findAspect pos tLine tCol ((dLine,dCol,length,a):tail) = do
+    let newLine = dLine + tLine
+    let newCol = if dLine == 0 then dCol + tCol else dCol
+    if rangeIn (LSP._line pos) (LSP._character pos) 1 (LSP.Range (LSP.Position newLine newCol) (LSP.Position newLine (newCol + length))) then
+        (Just a)
+    else 
+        findAspect pos newLine newCol tail
+findAspect pos tLine tCol [] = Nothing
+ 
+onGotoDefinition :: LSP.Uri -> LSP.Position -> ServerM (LspM Config) (Maybe LSP.Location)
+onGotoDefinition ur pos =
+  case LSP.uriToFilePath ur of 
+    Nothing -> return Nothing
+    Just path -> do 
+      c <- LSPServer.getConfig
+      (AbsolutePath fp) <- liftIO $ absolute path
+      let pathString = unpack fp
+      if Map.member pathString (loadedFiles c) then do
+             let (Just file) = Map.lookup pathString (loadedFiles c)
+             let (LoadedFileInfo hi tok asp) = file
+             let tAsp = findAspect pos 0 0 asp
+             config <- LSPServer.getConfig
+             let result = do
+                    aspContent <- tAsp
+                    def <- P.definitionSite aspContent
+                    tcState <- persistentTCState config
+                    defSite <- (Map.lookup (P.defSiteModule def) (TCM.stPreModuleToSource tcState))
+                    return (defSite,def)
+             case result of
+                Nothing -> return Nothing
+                (Just ((AbsolutePath text),def)) -> do
+                    index <- liftIO $ Index.fileToLineIndex (unpack text)
+                    let position = Index.offsetToPosition index (P.defSitePos def)
+                    return (Just (LSP.Location (LSP.filePathToUri (unpack text)) (LSP.Range position position)))
+      else do
+             loadFile ur
+             c <- LSPServer.getConfig
+             if Map.member pathString (loadedFiles c) then do
+                 let (Just file) = Map.lookup pathString (loadedFiles c)
+                 let (LoadedFileInfo hi tok asp) = file
+                 let tAsp = findAspect pos 0 0 asp
+                 return (Nothing)
+             else 
+                return Nothing
+
 
 
 --getTokenMap :: LSP.List LSP.UInt -> Text -> Map.Map String Int
@@ -412,17 +461,17 @@ loadFile uri =
                 cm <- get
                 fileContent <- liftIO $ readFile (unpack absPath)
                 let file = CM.theCurrentFile cm
-                
+                let persistentState = TCM.stPersistentState tc
+                let preScopeState = TCM.stPreScopeState tc
                 case file of 
                   Nothing -> do
-                      return empty
+                      return (empty,preScopeState)
                   Just content -> do
-                      let persistentState = TCM.stPersistentState tc
                       let modName = CM.currentFileModule content
                       let moduleInfo = Map.lookup modName (TCM.stDecodedModules persistentState)
                       case moduleInfo of
                           Nothing -> do
-                              return empty
+                              return (empty,preScopeState)
                           Just content -> do
                               --LSPServer.sendNotification LSP.SWindowShowMessage (LSP.ShowMessageParams LSP.MtError (pack "no current file :((("))
                               let highlight = TCM.iHighlighting $ TCM.miInterface content
@@ -432,12 +481,12 @@ loadFile uri =
                               let tokenMap = H.getTokenMap index H.defaultTokenMap (Array.listArray 
                                         (0, length fileContent) fileContent ) 0 0 aspectPositions
                               let tokenString = H.writeTokensResult semTokensContet
-                              return (LoadedFileInfo semTokensContet tokenMap aspectPositions)
+                              return ((LoadedFileInfo semTokensContet tokenMap aspectPositions),preScopeState)
             case newState of
                 Left _ -> return ()
-                Right state -> do
+                Right (state,ptc) -> do
                     c <- LSP.getConfig
-                    LSP.setConfig (c { loadedFiles = Map.insert (unpack absPath) state (loadedFiles c)})
+                    LSP.setConfig (c { loadedFiles = Map.insert (unpack absPath) state (loadedFiles c) , persistentTCState = (Just ptc)})
 
 --------------------------------------------------------------------------------
 -- Helper functions for converting stuff to SemanticTokenAbsolute

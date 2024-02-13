@@ -20,6 +20,7 @@ import qualified Language.LSP.Types as LSP
 import qualified Agda.Interaction.Highlighting.Precise as P
 import qualified Agda.Interaction.Base as IB
 import qualified Server.Index as Index
+import qualified Agda.TypeChecking.Monad.Base as TC
 
 getOptionsFromArgv :: IO Options
 getOptionsFromArgv = do
@@ -107,14 +108,15 @@ extractAgdaOpts argv =
 
 data LoadedFileInfo = LoadedFileInfo { hi :: (LSP.List LSP.UInt) , tok :: (Map.Map String LSP.UInt) , asp :: [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)]}
   deriving (Eq, Show, Generic)
-data Config = Config { configRawAgdaOptions :: [String] , loadedFiles :: Map.Map String LoadedFileInfo }
-  deriving (Eq, Show, Generic)
+data Config = Config { configRawAgdaOptions :: [String] , loadedFiles :: Map.Map String LoadedFileInfo , 
+    persistentTCState :: (Maybe TC.PreScopeState)}
+  deriving (Generic)
 
 empty :: LoadedFileInfo
 empty = LoadedFileInfo (LSP.List []) Map.empty [] 
 
 makeConf :: [String] -> Config
-makeConf strings = Config { configRawAgdaOptions = strings, loadedFiles = Map.empty}
+makeConf strings = Config { configRawAgdaOptions = strings, loadedFiles = Map.empty, persistentTCState = Nothing}
 
 instance FromJSON Config where
   parseJSON (Object v) = makeConf <$> v .: "commandLineOptions"

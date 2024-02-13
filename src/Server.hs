@@ -124,4 +124,13 @@ handlers =
         let RequestMessage _ _ _ (SemanticTokensParams _ _ (TextDocumentIdentifier uri)) = req
         result <- Handler.onHighlight uri
         responder (Right result)
+      ,
+      requestHandler STextDocumentDefinition $ \req responder -> do
+        let RequestMessage _ _ _ ( DefinitionParams (TextDocumentIdentifier uri) pos _ _ ) = req
+        result <- Handler.onGotoDefinition uri pos
+        case result of 
+            Nothing -> responder (Right (InR (InL (List []) )))
+            (Just result) -> responder (Right (InR (InL (List [result]) )))
+        --case result of 
+        --  Nothing -> return (InL (InL []))
     ]
