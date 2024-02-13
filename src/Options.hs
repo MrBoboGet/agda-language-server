@@ -105,7 +105,7 @@ extractAgdaOpts argv =
 
 --------------------------------------------------------------------------------
 
-data LoadedFileInfo = LoadedFileInfo (LSP.List LSP.UInt) (Map.Map String Int) [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)]
+data LoadedFileInfo = LoadedFileInfo { hi :: (LSP.List LSP.UInt) , tok :: (Map.Map String LSP.UInt) , asp :: [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)]}
   deriving (Eq, Show, Generic)
 data Config = Config { configRawAgdaOptions :: [String] , loadedFiles :: Map.Map String LoadedFileInfo }
   deriving (Eq, Show, Generic)

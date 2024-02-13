@@ -2,9 +2,11 @@ module Server.Highlight where
 import qualified Agda.Interaction.Highlighting.Precise as P
 import qualified Language.LSP.Server           as LSP
 import qualified Language.LSP.Types            as LSP
-import qualified Server.Index as Index
 import Agda.Interaction.Highlighting.Range as A
 import Data.List
+import Data.Array
+import qualified Data.Map as Map
+import qualified Server.Index as Index
 
 defaultTokenMap :: LSP.SemanticTokenTypes -> LSP.UInt
 defaultTokenMap a = fromIntegral $ case (elemIndex a LSP.knownSemanticTokenTypes) of
@@ -52,7 +54,7 @@ getAspectPositions prevLine prevCol index ( (A.Range start end , a) : tail) =
 convertRangeTokens :: LSP.UInt -> LSP.UInt -> (LSP.SemanticTokenTypes -> LSP.UInt) -> [(LSP.UInt , LSP.UInt, LSP.UInt ,P.Aspects)] -> LSP.List LSP.UInt
 convertRangeTokens eLine eCol map ( (dLine,dCol,length , a) : tail) = 
     let newELine = eLine + dLine in 
-    let newECol = if dLine == 0 then eCol + dCol else 0 in 
+    let newECol = if dLine == 0 then eCol + dCol else dCol in 
     case P.aspect a of 
     Nothing -> convertRangeTokens newELine newECol map tail
     Just asp -> do 
@@ -64,6 +66,34 @@ convertRangeTokens eLine eCol map ( (dLine,dCol,length , a) : tail) =
                         [ dLine + eLine , dCol + (if dLine == 0 then eCol else 0), length , map $ aspectToSemantic asp, 0]) 
                         <> convertRangeTokens 0 0 map tail
 convertRangeTokens _ _ map [] = LSP.List []
+
+
+getString :: Index.LineIndex -> Array Int Char -> LSP.UInt -> LSP.UInt -> LSP.UInt -> String
+getString index content line col length = 
+    do 
+        if length == 0 then "" else do
+            let offset = Index.positionToOffset index (LSP.Position line col)
+            if offset >= snd (bounds content) then "" else do
+                if (content ! offset) == '\n' || (content ! offset) == '\r' then "" else  
+                    (content ! offset) : getString index content line (col + 1) (length - 1)
+
+getTokenMap :: Index.LineIndex -> (LSP.SemanticTokenTypes -> LSP.UInt) ->  Array Int Char -> 
+            LSP.UInt -> LSP.UInt -> [(LSP.UInt ,LSP.UInt,LSP.UInt,P.Aspects)] -> Map.Map String LSP.UInt
+getTokenMap index tmap content tLine tCol ((dLine,dCol,cLength,a):tail) = do
+    let newCol = if dLine == 0 then dCol+tCol else dCol 
+    let newLine = tLine+dLine 
+    case P.aspect a of
+        Nothing -> getTokenMap index tmap content newLine newCol tail
+        (Just asp) -> 
+            do 
+                if asp == P.Symbol then getTokenMap index tmap content newLine newCol tail else do
+                  let newToken = getString index content newLine newCol cLength 
+                  let recMap = getTokenMap index tmap content newLine newCol tail 
+                  if Map.member newToken recMap then
+                      recMap
+                  else 
+                      Map.insert newToken (tmap (aspectToSemantic asp)) recMap
+getTokenMap _ _ _ _ _ _ = empty
 
 
 getWriteContent :: [(A.Range , P.Aspects)] -> String
@@ -80,3 +110,6 @@ writeTokensResult :: LSP.List LSP.UInt -> String
 writeTokensResult (LSP.List (x1:x2:x3:x4:x5:tail)) = (foldl (\x y -> x <> " " <> (show y)) "" [x1,x2,x3,x4,x5]) <> "\n" <> 
     (writeTokensResult (LSP.List tail))
 writeTokensResult _ = ""
+
+getAspectListString :: [(LSP.UInt,LSP.UInt,LSP.UInt,a)] -> String
+getAspectListString l = foldl (\left (x1,x2,x3,_) -> left <>  (show (x1,x2,x3) <> "\n")) "" l

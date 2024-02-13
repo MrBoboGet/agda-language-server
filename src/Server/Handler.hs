@@ -1,4 +1,5 @@
-{-# LANGUAGE CPP #-} module Server.Handler where
+{-# LANGUAGE CPP #-} 
+module Server.Handler where
 
 import           Agda                           ( getCommandLineOptions
                                                 , runAgda
@@ -77,6 +78,7 @@ import qualified Language.LSP.Server as LSPServer
 
 import qualified Agda.TypeChecking.Errors as TCM
 import qualified Agda.TypeChecking.Monad  as TCM
+import qualified Agda.TypeChecking.Monad.Base  as TCM
 import qualified Agda.TypeChecking.Pretty as TCM
 import qualified Agda.Interaction.Highlighting.Generate as G
 import Agda.Utils.List            ( caseList, last1 )
@@ -85,6 +87,10 @@ import qualified Server.Highlight as H
 import qualified Agda.Interaction.Base as CM
 import qualified Agda.Interaction.Highlighting.Precise as P
 import qualified Agda.Interaction.Highlighting.Range as A
+import qualified Server.Parsing as Parsing
+import qualified Data.Array as Array
+import Data.Array ((!))
+import Agda.Syntax.Parser                   as P
 
 initialiseCommandQueue :: IO CommandQueue
 initialiseCommandQueue = CommandQueue <$> newTChanIO <*> newTVarIO Nothing
@@ -171,22 +177,28 @@ onDocumentChanged ur changes@(LSP.List changesList) = do
                 Nothing -> return ()
                 Just vvfile -> do
                     let text = VFS.virtualFileText vvfile
+                    --let text = pack "suc zero ( )\nSet + "
                     let textLines = T.lines text
                     (AbsolutePath fp) <- liftIO $ absolute path
                     let pathString = unpack fp
                     if Map.member pathString (loadedFiles c) then do
                            let (Just file) = Map.lookup pathString (loadedFiles c)
                            let fileInfo@(LoadedFileInfo hi tok asp) = file
-                           let newFile@(LoadedFileInfo nHi _ _) = updateLoadedFile fileInfo changes
-                           liftIO $ writeFile "C:/Users/emanu/Desktop/Program/Haskell/agda-language-server/lineDiffs.txt" 
-                                    (show (lineDiff (head changesList) , colDiff (head changesList)))
-                           liftIO $ writeFile "C:/Users/emanu/Desktop/Program/Haskell/agda-language-server/sem1.txt" (H.writeTokensResult nHi)
-                           liftIO $ writeFile "C:/Users/emanu/Desktop/Program/Haskell/agda-language-server/sem2.txt" (H.writeTokensResult hi)
-                           let front@(LSP.TextDocumentContentChangeEvent (Just range) _ text) = head changesList
-                           liftIO $ TIO.writeFile "C:/Users/emanu/Desktop/Program/Haskell/agda-language-server/text.txt" text
-                           liftIO $ writeFile "C:/Users/emanu/Desktop/Program/Haskell/agda-language-server/range.txt" (show range)
+                           let stringContent = (unpack text)
+                           let content = (Array.listArray (0 , Text.length text) stringContent)
+                           let newIndex = Index.stringToLineIndex stringContent
+                           let newFile@(LoadedFileInfo nHi@(LSP.List lnHi) ntok nasp) = (updateLoadedFile fileInfo newIndex content changes)
                            LSPServer.setConfig (c {loadedFiles = Map.insert pathString newFile (loadedFiles c)  })
-                           return ()
+                           let change@(LSP.TextDocumentContentChangeEvent startRange@(Just (LSP.Range s e)) _ _) = (head changesList)
+                           let changeRange = (LSP.Range (LSP.Position (LSP._line s) 0) (LSP.Position ((LSP._line s) + lineDiff change + 2) 0))
+                           hi3 <- liftIO $ runPMIO $ weaveNewTokens newIndex tok content changeRange 0 0 lnHi 
+                           --hi3 <- liftIO $ runPMIO $ weaveNewTokens newIndex tok content changeRange 1 0 [1,0,4,12,0]
+                           case hi3 of 
+                                (Left a,_) -> return ()
+                                (Right newTokens,_) -> do
+                                   let front@(LSP.TextDocumentContentChangeEvent (Just range) _ text) = head changesList
+                                   LSPServer.setConfig (c {loadedFiles = Map.insert pathString (newFile {hi = (LSP.List newTokens) })(loadedFiles c)  })
+                                   return ()
                     else 
                         return ()
 
@@ -214,8 +226,8 @@ onHighlight ur =
 
 
 
-getTokenMap :: LSP.List LSP.UInt -> Text -> Map.Map String Int
-getTokenMap _ _ = Map.empty
+--getTokenMap :: LSP.List LSP.UInt -> Text -> Map.Map String Int
+--getTokenMap _ _ = Map.empty
 
 --updateHighlighting :: LSP.List LSP.UInt -> LSP.TextDocumentContentChangeEvent -> LSP.List LSP.UInt
 --updateHighlighting _ _ = LSP.List []
@@ -227,9 +239,14 @@ pointIn line col range@(LSP.Range start end) | LSP._line start == LSP._line end 
                                              | otherwise = False
 
 rangeIn :: LSP.UInt -> LSP.UInt -> LSP.UInt -> LSP.Range -> Bool
-rangeIn line col length range@(LSP.Range start end) = (pointIn line col range) || (pointIn line (col + length) range)
+rangeIn line col length range@(LSP.Range start end) =
+    let tokenRange = (LSP.Range (LSP.Position line col) (LSP.Position line (col+length))) in
+        ((pointIn line col range) || (pointIn line (col + length) range)) || ( (pointIn (LSP._line start) (LSP._character start) tokenRange) ||
+            (pointIn (LSP._line start) (LSP._character end) tokenRange))
+
 after :: LSP.UInt -> LSP.UInt -> LSP.UInt -> LSP.Range -> Bool
-after line col length range@(LSP.Range start end) = not (rangeIn line col length range) && line >= LSP._line end && col >= LSP._character end
+after line col length range@(LSP.Range start end) = (not (rangeIn line col length range)) && 
+            (line > LSP._line end ||  (line == LSP._line end &&  col >= LSP._character end))
 
 lineCount :: Text -> LSP.UInt
 lineCount text = do
@@ -248,37 +265,116 @@ colCount text = do
     else
         fromIntegral $ T.length (last textLines)
 lineDiff :: LSP.TextDocumentContentChangeEvent  -> LSP.UInt
-lineDiff e@(LSP.TextDocumentContentChangeEvent (Just (LSP.Range start end)) _ text) = LSP._line start - LSP._line end + lineCount text
+lineDiff e@(LSP.TextDocumentContentChangeEvent (Just (LSP.Range start end)) _ text) = (LSP._line start - LSP._line end) + lineCount text
 lineDiff _ = 0
-colDiff :: LSP.TextDocumentContentChangeEvent -> LSP.UInt
-colDiff e@(LSP.TextDocumentContentChangeEvent (Just (LSP.Range start end)) _ _) | LSP._line end == LSP._line start = LSP._character start - LSP._character end
-                                                                                | otherwise = LSP._character end 
-colDiff _ = 0
+colDiff :: LSP.UInt -> LSP.UInt -> LSP.UInt -> LSP.TextDocumentContentChangeEvent -> LSP.UInt
+colDiff preColDistance line col e@(LSP.TextDocumentContentChangeEvent (Just (LSP.Range start end)) _ text) 
+            | line > LSP._line end = 0
+            | addedLines >= 1 =  (- LSP._character end) + colCount text  --preColDistance not needed
+            | LSP._line start == LSP._line end  = colCount text - (LSP._character end - LSP._character start)
+            | otherwise = preColDistance + (- LSP._character end) + colCount text  
+      where 
+        addedLines = lineCount text
+colDiff _ _ _ _ = 0
 
-updateAspectMapImpl :: LSP.UInt -> LSP.UInt -> LSP.UInt -> LSP.UInt -> [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)] -> LSP.TextDocumentContentChangeEvent -> [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)]
-updateAspectMapImpl eLine eCol tLine tCol (head@(dLine,dCol,cLength,a):tail) e@(LSP.TextDocumentContentChangeEvent (Just range@(LSP.Range start end)) _ _ ) = do
+updateAspectMapImpl :: LSP.UInt -> LSP.UInt -> LSP.UInt -> LSP.UInt -> LSP.UInt -> [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)] -> LSP.TextDocumentContentChangeEvent -> [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)]
+updateAspectMapImpl eLine eCol tLine tCol pcolDistRange (head@(dLine,dCol,cLength,a):tail) e@(LSP.TextDocumentContentChangeEvent (Just range@(LSP.Range start end)) _ _ ) = do
     let newLine = tLine + dLine
     let pnewCol = tCol + dCol
     let neCol = if dLine == 0 then eCol else 0
     let newCol = if dLine == 0 then pnewCol else dCol
+    let newColDistRange =if LSP._line start == tLine then LSP._character start - newCol else pcolDistRange
     if rangeIn newLine newCol cLength range then 
-        updateAspectMapImpl (dLine + eLine ) (dCol + neCol) newLine newCol tail e
+        updateAspectMapImpl (dLine + eLine ) (dCol + neCol) newLine newCol pcolDistRange tail e
     else
         if after newLine newCol cLength range then
-            (dLine+(eLine+ lineDiff e)  , dCol+(neCol + colDiff e),cLength,a) : tail
-            --(newLine ,newCol,cLength,a) : tail
+            (dLine+(eLine+ lineDiff e)  , dCol+(neCol + colDiff pcolDistRange newLine newCol e),cLength,a) : tail
         else
-            head : updateAspectMapImpl 0 0 newLine newCol tail e
-updateAspectMapImpl _ _ _ _ _ _ = []
+            head : updateAspectMapImpl 0 0 newLine newCol newColDistRange tail e
+updateAspectMapImpl _ _ _ _ _ _ _ = []
 
 updateAspectMap :: [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)] -> LSP.TextDocumentContentChangeEvent -> [(LSP.UInt,LSP.UInt,LSP.UInt,P.Aspects)]
-updateAspectMap = updateAspectMapImpl 0 0 0 0
+updateAspectMap l e@(LSP.TextDocumentContentChangeEvent (Just (LSP.Range start end)) _ _) = updateAspectMapImpl 0 0 0 0 (LSP._character start) l e
+updateAspectMap _ _ = []
 
-updateLoadedFile :: LoadedFileInfo -> LSP.List LSP.TextDocumentContentChangeEvent -> LoadedFileInfo
-updateLoadedFile (LoadedFileInfo hi tok asp) (LSP.List updates) = do
+updateSemanticTokens :: LSP.UInt -> LSP.UInt -> LSP.UInt -> LSP.UInt -> LSP.UInt -> [LSP.UInt]  -> LSP.TextDocumentContentChangeEvent -> [LSP.UInt]
+updateSemanticTokens eLine eCol tLine tCol pcolDistRange (dLine:dCol:cLength:x1:x2:tail) e@(LSP.TextDocumentContentChangeEvent (Just range@(LSP.Range start end)) _ _ ) = do
+    let newLine = tLine + dLine
+    let pnewCol = tCol + dCol
+    let neCol = if dLine == 0 then eCol else 0
+    let newCol = if dLine == 0 then pnewCol else dCol
+    let newColDistRange =if LSP._line start == tLine then LSP._character start - newCol else pcolDistRange
+    if rangeIn newLine newCol cLength range then 
+        updateSemanticTokens (dLine + eLine ) (dCol + neCol) newLine newCol pcolDistRange tail e
+    else
+        if after newLine newCol cLength range then
+             dLine+(eLine+ lineDiff e) :(dCol+(neCol + colDiff pcolDistRange newLine newCol e)):cLength:x1:x2 : tail
+        else
+            dLine:dCol:cLength:x1:x2:updateSemanticTokens 0 0 newLine newCol newColDistRange tail e
+updateSemanticTokens _ _ _ _ _ _ _ = []
+
+
+
+updateSemanticTokensMap :: [LSP.UInt] -> LSP.TextDocumentContentChangeEvent -> [LSP.UInt]
+updateSemanticTokensMap l e@(LSP.TextDocumentContentChangeEvent (Just (LSP.Range start end)) _ _) = updateSemanticTokens 0 0 0 0 (LSP._character start) l e
+updateSemanticTokensMap _ _ = []
+
+
+nextWhitespacePosition :: Array.Array Int Char -> Int -> Int
+nextWhitespacePosition content offset | offset >= snd (Array.bounds content) = snd (Array.bounds content)
+                                      | otherwise = if (content Array.! offset) == '\r' || (content Array.! offset) == '\n' then offset else
+                                                nextWhitespacePosition content (offset + 1)
+lineEnd :: Index.LineIndex -> Array.Array Int Char -> Int -> Int
+lineEnd index content line = do
+    let offset = Index.positionToOffset index (LSP.Position (fromIntegral line) 0)
+    nextWhitespacePosition content offset 
+
+intervallToString :: Index.LineIndex -> Array.Array Int Char -> LSP.Range -> String
+intervallToString index content (LSP.Range start end) = do
+    let oStart = (Index.positionToOffset index start)
+    let oEnd = (Index.positionToOffset index end)
+    Parsing.offsetsToString content oStart oEnd
+
+encodeTokens :: LSP.UInt -> LSP.UInt -> [(LSP.Range,LSP.UInt)] -> [LSP.UInt]
+encodeTokens tLine tCol (((LSP.Range start end),tokenType):tail) = do
+    let dCol = (LSP._character start)-tCol 
+    0:dCol:(LSP._character end - LSP._character start):tokenType:0:(encodeTokens tLine (tCol+dCol) tail)
+encodeTokens tLine tCol [] = []
+
+weaveNewTokens :: Index.LineIndex -> Map.Map String LSP.UInt -> Array.Array Int Char -> LSP.Range -> LSP.UInt -> LSP.UInt -> [LSP.UInt] -> PM [LSP.UInt]
+weaveNewTokens index tmap content range tLine tCol (dLine:dCol:cLength:x1:x2:tail) 
+        | not ((rangeIn  tLine tCol 1 range) || (rangeIn newLine tLine 1 range) || ((after  newLine newCol 1 range) && not (after tLine tCol 1 range)))  = do
+                    tailResult <- (weaveNewTokens index tmap content range (tLine+dLine) (if tLine == 0 then tCol+dCol else dCol) tail)
+                    return (dLine:dCol:cLength:x1:x2:tailResult)
+        | otherwise = do
+    let lastCol = if dLine == 0 then tCol + dCol else fromIntegral $ lineEnd index content (fromIntegral tLine)
+    tokens <- Parsing.parseTokenIntervals index content tLine tCol lastCol
+    let newTokens = map (\(Just x) -> x) (filter (/= Nothing ) (map (\x -> do 
+            let tokenString = intervallToString index content x 
+            let member = Map.lookup tokenString tmap 
+            case member of
+                Just tokenType -> (Just (x,tokenType)) 
+                Nothing ->  Nothing) tokens))
+    if length newTokens == 0 then do
+            tailResult <- weaveNewTokens index tmap content range newLine newCol tail
+            return (dLine:dCol:cLength:x1:x2:tailResult) else  do
+        let extraTokens = encodeTokens tLine tCol newTokens
+        tailResult <- weaveNewTokens index tmap content range (tLine + dLine) newCol tail
+        let modifiedCol = if dLine == 0 then dCol - ((\(LSP.Range f s) -> (LSP._character f)) (fst (last newTokens)) - tCol) else dCol
+        return (extraTokens <> (dLine:modifiedCol:cLength:x1:x2:tailResult))
+    where 
+        newCol = if dLine == 0 then tCol + dCol else dCol
+        newLine = tLine+dLine
+
+weaveNewTokens index tmap content _ _ _ _ = return []
+
+updateLoadedFile :: LoadedFileInfo -> Index.LineIndex -> (Array.Array Int Char) -> LSP.List LSP.TextDocumentContentChangeEvent -> LoadedFileInfo
+updateLoadedFile (LoadedFileInfo (LSP.List hi) tok asp) index content (LSP.List updates) = do
           let newAspectPositions = foldl updateAspectMap asp updates
-          let hi2 = H.convertRangeTokens 0 0 H.defaultTokenMap newAspectPositions
-          LoadedFileInfo hi2 tok newAspectPositions
+          --let hi2 = H.convertRangeTokens 0 0 H.defaultTokenMap newAspectPositions
+          let hi2 = foldl updateSemanticTokensMap hi updates
+          --hi3 <- weaveNewTokens index tok content 0 0 hi2 
+          LoadedFileInfo (LSP.List hi2) tok newAspectPositions
 
 loadFile :: LSP.Uri -> ServerM (LspM Config) ()
 loadFile uri = 
@@ -288,12 +384,12 @@ loadFile uri =
             (AbsolutePath absPath) <- liftIO $ absolute path
             newState <- runCommandM  $ do
                 cmd_load' (unpack absPath) [] True Imp.TypeCheck $ \_ -> return ()
-                index <- liftIO $ Index.fileToLineIndex (unpack absPath)
                 tc <- TCM.getTC
                 cm <- get
-                index <- liftIO $ Index.fileToLineIndex (unpack absPath)
+                index@(Index.LineIndex _ newLineSize) <- liftIO $ Index.fileToLineIndex (unpack absPath)
                 tc <- TCM.getTC
                 cm <- get
+                fileContent <- liftIO $ readFile (unpack absPath)
                 let file = CM.theCurrentFile cm
                 
                 case file of 
@@ -312,7 +408,8 @@ loadFile uri =
                               let listTokens = P.toList highlight
                               let aspectPositions = H.getAspectPositions 0 0 index listTokens
                               let semTokensContet = H.convertRangeTokens 0 0 H.defaultTokenMap aspectPositions 
-                              let tokenMap = getTokenMap (LSP.List []) absPath 
+                              let tokenMap = H.getTokenMap index H.defaultTokenMap (Array.listArray 
+                                        (0, length fileContent) fileContent ) 0 0 aspectPositions
                               let tokenString = H.writeTokensResult semTokensContet
                               return (LoadedFileInfo semTokensContet tokenMap aspectPositions)
             case newState of

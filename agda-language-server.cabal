@@ -68,6 +68,7 @@ library
       Server.Handler
       Server.Highlight
       Server.Index
+      Server.Parsing
       Server.ResponseController
       Switchboard
   other-modules:
@@ -189,6 +190,7 @@ test-suite als-test
       Server.Handler
       Server.Highlight
       Server.Index
+      Server.Parsing
       Server.ResponseController
       Switchboard
       Paths_agda_language_server

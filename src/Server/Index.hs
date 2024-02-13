@@ -5,32 +5,47 @@ import qualified Language.LSP.Types as LSP
 import Agda.Interaction.Highlighting.Range as A
 
 
-type LineIndex = (Array Int Int)
-empty :: LineIndex
-empty = array (0,0) []
+data LineIndex = LineIndex (Array Int Int) Int 
 
-newLines :: Int -> String -> [Int]
-newLines offset [] = []
-newLines offset ('\n':tail) = offset : newLines (offset + 1) tail
+instance Show LineIndex where
+    show (LineIndex a l) = (show a) <> "\nNewLineType " <> (show l)
+empty :: LineIndex
+empty = LineIndex (array (0,0) []) 2
+
+newLines :: Int -> String -> ([Int],Int)
+newLines offset [] = ([],1)
+newLines offset ('\n':tail) = do
+        let head =  offset 
+        let (recTail,size) = newLines (offset + 1) tail
+        (head:recTail , size)
+newLines offset ('\r':tail) = do 
+    let (result,_) = newLines (offset + 1) tail
+    (result,2)
 newLines offset (x:tail) = newLines (offset + 1) tail
+
+stringToLineIndex :: String -> LineIndex
+stringToLineIndex text = do
+    let (oLines,newLineSize) = newLines 0 text
+    let lines = 0:oLines
+    let result = listArray (0,length lines) lines
+    (LineIndex result newLineSize)
 
 fileToLineIndex :: FilePath -> IO LineIndex
 fileToLineIndex p = do 
                         text <- readFile p
-                        let lines = 0 : newLines 0 text
-                        let result = listArray (0,length lines) lines
-                        return result
+                        return (stringToLineIndex text)
 
 offsetToPosition :: LineIndex -> Int -> LSP.Position
 offsetToPosition index 1 = LSP.Position 0 0
-offsetToPosition index offset = let line = max (binarySearch (<) index offset-1) 0 in
+offsetToPosition (LineIndex index newlineSize) offset = let line = max (binarySearch (<) index offset-1) 0 in
                                 let lineOffset = fromIntegral (index ! line) in
+                                if line == 0 then (LSP.Position 0 (fromIntegral  (offset - 1))) else 
                                 if line > 0 && (offset-1 == lineOffset) then
                                     (LSP.Position (fromIntegral (line -1)) (fromIntegral (lineOffset - (index ! (line -1)))))
                                 else
                                     LSP.Position (fromIntegral line) (fromIntegral (offset - (fromIntegral (index ! line) + 2)))
 positionToOffset :: LineIndex -> LSP.Position -> Int
-positionToOffset index (LSP.Position line col) = ((index ! (fromIntegral line)) + fromIntegral col)+1
+positionToOffset (LineIndex index newlineSize) (LSP.Position line col) = ((index ! (fromIntegral line)) + fromIntegral col)+1
 
 binarySearchImpl :: Int -> Int -> (a -> b -> Bool) -> Array Int a -> b -> Int
 binarySearchImpl lower upper less array target = let index = div (lower + upper) 2
