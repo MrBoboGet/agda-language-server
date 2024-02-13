@@ -181,7 +181,7 @@ onDocumentChanged ur changes@(LSP.List changesList) = do
                     let textLines = T.lines text
                     (AbsolutePath fp) <- liftIO $ absolute path
                     let pathString = unpack fp
-                    if Map.member pathString (loadedFiles c) then do
+                    when (Map.member pathString (loadedFiles c)) $ do
                            let (Just file) = Map.lookup pathString (loadedFiles c)
                            let fileInfo@(LoadedFileInfo hi tok asp) = file
                            let stringContent = (unpack text)
@@ -199,8 +199,6 @@ onDocumentChanged ur changes@(LSP.List changesList) = do
                                    let front@(LSP.TextDocumentContentChangeEvent (Just range) _ text) = head changesList
                                    LSPServer.setConfig (c {loadedFiles = Map.insert pathString (newFile {hi = (LSP.List newTokens) })(loadedFiles c)  })
                                    return ()
-                    else 
-                        return ()
 
 onHighlight :: LSP.Uri -> ServerM (LspM Config) (Maybe LSP.SemanticTokens)
 onHighlight ur =
@@ -337,36 +335,59 @@ intervallToString index content (LSP.Range start end) = do
 
 encodeTokens :: LSP.UInt -> LSP.UInt -> [(LSP.Range,LSP.UInt)] -> [LSP.UInt]
 encodeTokens tLine tCol (((LSP.Range start end),tokenType):tail) = do
-    let dCol = (LSP._character start)-tCol 
-    0:dCol:(LSP._character end - LSP._character start):tokenType:0:(encodeTokens tLine (tCol+dCol) tail)
+    let dLine = (LSP._line start - tLine)
+    let newLine = LSP._line start
+    let newCol = LSP._character start
+    let dCol = if dLine == 0 then (LSP._character start)-tCol else LSP._character start
+    dLine:dCol:(LSP._character end - LSP._character start):tokenType:0:(encodeTokens newLine newCol tail)
 encodeTokens tLine tCol [] = []
 
-weaveNewTokens :: Index.LineIndex -> Map.Map String LSP.UInt -> Array.Array Int Char -> LSP.Range -> LSP.UInt -> LSP.UInt -> [LSP.UInt] -> PM [LSP.UInt]
-weaveNewTokens index tmap content range tLine tCol (dLine:dCol:cLength:x1:x2:tail) 
-        | not ((rangeIn  tLine tCol 1 range) || (rangeIn newLine tLine 1 range) || ((after  newLine newCol 1 range) && not (after tLine tCol 1 range)))  = do
-                    tailResult <- (weaveNewTokens index tmap content range (tLine+dLine) (if tLine == 0 then tCol+dCol else dCol) tail)
-                    return (dLine:dCol:cLength:x1:x2:tailResult)
-        | otherwise = do
-    let lastCol = if dLine == 0 then tCol + dCol else fromIntegral $ lineEnd index content (fromIntegral tLine)
-    tokens <- Parsing.parseTokenIntervals index content tLine tCol lastCol
+
+
+getNewTokens :: Index.LineIndex -> Map.Map String LSP.UInt -> Array.Array Int Char -> Int -> Int ->  PM [(LSP.Range,LSP.UInt)]
+getNewTokens index tmap content begin end = do
+    --let lastCol = if dLine == 0 then tCol + dCol else fromIntegral $ lineEnd index content (fromIntegral tLine)
+    tokens <- Parsing.parseTokenIntervals index content (fromIntegral (begin + 1)) (fromIntegral (end + 1))
     let newTokens = map (\(Just x) -> x) (filter (/= Nothing ) (map (\x -> do 
             let tokenString = intervallToString index content x 
             let member = Map.lookup tokenString tmap 
             case member of
                 Just tokenType -> (Just (x,tokenType)) 
                 Nothing ->  Nothing) tokens))
+    return newTokens
+
+weaveNewTokens :: Index.LineIndex -> Map.Map String LSP.UInt -> Array.Array Int Char -> LSP.Range -> LSP.UInt -> LSP.UInt -> [LSP.UInt] -> PM [LSP.UInt]
+weaveNewTokens index tmap content range tLine tCol (dLine:dCol:cLength:x1:x2:tail) 
+        | not ((rangeIn  tLine tCol 1 range) || (rangeIn newLine tLine 1 range) || ((after  newLine newCol 1 range) && not (after tLine tCol 1 range)))  = do
+                    tailResult <- (weaveNewTokens index tmap content range newLine newCol tail)
+                    return (dLine:dCol:cLength:x1:x2:tailResult)
+        | otherwise = do
+    let beginOffset = Index.positionToOffset index (LSP.Position tLine tCol)
+    let endOffset = Index.positionToOffset index (LSP.Position newLine newCol)
+    --let lastCol = if dLine == 0 then tCol + dCol else fromIntegral $ lineEnd index content (fromIntegral tLine)
+    newTokens <- getNewTokens index tmap content beginOffset endOffset
     if length newTokens == 0 then do
             tailResult <- weaveNewTokens index tmap content range newLine newCol tail
-            return (dLine:dCol:cLength:x1:x2:tailResult) else  do
+            return (dLine:dCol:cLength:x1:x2:tailResult) 
+    else do
         let extraTokens = encodeTokens tLine tCol newTokens
+        let lastNewTokenPosition =  (\(LSP.Range f s) -> f) (fst (last newTokens))
         tailResult <- weaveNewTokens index tmap content range (tLine + dLine) newCol tail
-        let modifiedCol = if dLine == 0 then dCol - ((\(LSP.Range f s) -> (LSP._character f)) (fst (last newTokens)) - tCol) else dCol
-        return (extraTokens <> (dLine:modifiedCol:cLength:x1:x2:tailResult))
+
+        let modifiedLine = dLine - ((LSP._line lastNewTokenPosition) - tLine)
+        let modifiedCol | dLine == 0 = dCol - (LSP._character lastNewTokenPosition  - tCol) 
+                        | LSP._line lastNewTokenPosition == newLine = dCol - (LSP._character lastNewTokenPosition)
+                        | otherwise = dCol
+        return (extraTokens ++ (modifiedLine:modifiedCol:cLength:x1:x2:tailResult))
     where 
         newCol = if dLine == 0 then tCol + dCol else dCol
         newLine = tLine+dLine
 
-weaveNewTokens index tmap content _ _ _ _ = return []
+weaveNewTokens index tmap content range tLine tCol _ = do
+    newTokens <- getNewTokens index tmap content (Index.positionToOffset index (LSP.Position tLine tCol)) ((snd . Array.bounds $ content) - 1)
+    if length newTokens == 0 then return [] else do
+        let extraTokens = encodeTokens tLine tCol newTokens
+        return extraTokens
 
 updateLoadedFile :: LoadedFileInfo -> Index.LineIndex -> (Array.Array Int Char) -> LSP.List LSP.TextDocumentContentChangeEvent -> LoadedFileInfo
 updateLoadedFile (LoadedFileInfo (LSP.List hi) tok asp) index content (LSP.List updates) = do

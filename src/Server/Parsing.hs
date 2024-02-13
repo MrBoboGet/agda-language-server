@@ -20,11 +20,17 @@ offsetsToString content start end | fromIntegral start >= snd (Array.bounds cont
                                   | start == end = ""
                                   | otherwise = if (content ! start) == '\r' || (content ! start) == '\n' then "" else (content ! start):offsetsToString content (start + 1) end
 
-parseTokens :: Index.LineIndex -> Array.Array Int Char -> LSP.UInt -> LSP.UInt -> LSP.UInt -> PM [Token]
-parseTokens index content line col lastCol = do
-    let characterOffset = (Index.positionToOffset index  (LSP.Position line col)) + 1
-    let initPos = (Pn {srcFile = SM.Nothing , posPos = fromIntegral characterOffset , posLine = fromIntegral line , posCol = fromIntegral col})
-    (result, a) <- parsePosString tokensParser initPos (offsetsToString content (characterOffset - 1) (characterOffset - 1 + (fromIntegral  (lastCol - col)) ))
+offsetsToMultilineString :: Array.Array Int Char -> Int -> Int -> String
+offsetsToMultilineString content start end | fromIntegral start >= snd (Array.bounds content) = ""
+                                  | start == end = ""
+                                  | otherwise = (content ! start):offsetsToMultilineString content (start + 1) end
+
+parseTokens :: Index.LineIndex -> Array.Array Int Char -> LSP.UInt -> LSP.UInt -> PM [Token]
+parseTokens index content startOffset endOffset = do
+    let startPosition = (Index.offsetToPosition index (fromIntegral startOffset))
+    let initPos = (Pn {srcFile = SM.Nothing , posPos = fromIntegral startOffset , posLine = fromIntegral (LSP._line startPosition) , 
+            posCol = fromIntegral (LSP._character startPosition) })
+    (result, a) <- parsePosString tokensParser initPos (offsetsToMultilineString content (fromIntegral (startOffset - 1)) (fromIntegral (endOffset - 1) ))
     return result
 
 
@@ -41,10 +47,10 @@ isSymbol :: Token -> Bool
 isSymbol (TokSymbol _ _) = True
 isSymbol _ = False
 
-parseTokenIntervals :: Index.LineIndex -> Array.Array Int Char -> LSP.UInt -> LSP.UInt -> LSP.UInt -> PM [LSP.Range]
-parseTokenIntervals index content line col lastCol = do
-    tokens <-  parseTokens index content line col lastCol
+parseTokenIntervals :: Index.LineIndex -> Array.Array Int Char -> LSP.UInt -> LSP.UInt -> PM [LSP.Range]
+parseTokenIntervals index content startOffset endOffset = do
+    tokens <-  parseTokens index content startOffset endOffset
     let newTokens = filter (not . isSymbol) tokens
-    let intervals = foldl (<>) [] (map tokenToIntervalls newTokens)
+    let intervals = concatMap tokenToIntervalls newTokens
     let returnValue = map (intervallToRange index) intervals
     return returnValue
